@@ -1,0 +1,12 @@
+const express = require('express');
+const router = express.Router();
+const usuarioController = require('../controllers/UsuarioController');
+
+// Rota para listar todos os usuários
+router.get('/', usuarioController.listarTodos);
+router.get('/:id', usuarioController.buscarPorId);
+router.post('/', usuarioController.criar);
+router.put('/:id', usuarioController.atualizar);
+router.delete('/:id', usuarioController.deletar);
+
+module.exports = router;

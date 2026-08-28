@@ -20,3 +20,11 @@ model Produto {
   preco Float 
   quantidade Int 
 }
+
+model Usuario {
+  id Int @id @default(autoincrement())
+  nome String
+  telefone String
+  email String
+  senha String
+}
