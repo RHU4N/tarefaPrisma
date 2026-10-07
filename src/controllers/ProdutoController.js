@@ -1,13 +1,16 @@
 const prisma = require("../config/prisma");
+const validarProduto = require("../utils/validarProduto");
 
 // LISTAR TODOS
 exports.listar = async (req, res) => {
   try {
-    const produtos = await prisma.produto.findMany({ orderBy: { id: "asc" } });
+    const produtos = await prisma.produto.findMany({
+      orderBy: { id: "asc" },
+    });
     res.status(200).json(produtos);
   } catch (error) {
     console.error(error);
-    res.status(500).json({ erro: "Erro ao listar produtos" });
+    res.status(500).json({ erro: "Erro ao buscar produtos" });
   }
 };
 
@@ -23,7 +26,6 @@ exports.buscarPorId = async (req, res) => {
     const produto = await prisma.produto.findUnique({
       where: { id },
     });
-
     if (!produto) {
       return res.status(404).json({ erro: "Produto não encontrado" });
     }
@@ -40,15 +42,10 @@ exports.criar = async (req, res) => {
   try {
     const { nome, descricao, preco, quantidade } = req.body;
 
-    if (!nome || nome.trim() === "") {
-      return res.status(400).json({ erro: "Nome é obrigatório" });
-    }
-    if (preco === undefined || Number(preco) <= 0) {
-      return res.status(400).json({ erro: "Preço deve ser maior que zero" });
-    }
+    const erro = validarProduto(nome, preco, quantidade);
 
-    if (quantidade === undefined || Number(quantidade) < 0) {
-      return res.status(400).json({ erro: "Quantidade não pode ser negativa" });
+    if (erro) {
+      return res.status(400).json({ erro });
     }
 
     const novoProduto = await prisma.produto.create({
@@ -72,26 +69,25 @@ exports.atualizar = async (req, res) => {
   try {
     const id = Number(req.params.id);
     const { nome, descricao, preco, quantidade } = req.body;
+
     if (isNaN(id)) {
       return res.status(400).json({ erro: "ID inválido" });
     }
+
     const produtoExistente = await prisma.produto.findUnique({
       where: { id },
     });
+
     if (!produtoExistente) {
       return res.status(404).json({ erro: "Produto não encontrado" });
     }
-    if (!nome || nome.trim() === "") {
-      return res.status(400).json({ erro: "Nome é obrigatório" });
+
+    const erro = validarProduto(nome, preco, quantidade);
+
+    if (erro) {
+      return res.status(400).json({ erro });
     }
 
-    if (preco === undefined || Number(preco) <= 0) {
-      return res.status(400).json({ erro: "Preço deve ser maior que zero" });
-    }
-
-    if (quantidade === undefined || Number(quantidade) < 0) {
-      return res.status(400).json({ erro: "Quantidade não pode ser negativa" });
-    }
     const produtoAtualizado = await prisma.produto.update({
       where: { id },
       data: {
@@ -129,7 +125,6 @@ exports.deletar = async (req, res) => {
     await prisma.produto.delete({
       where: { id },
     });
-
     res.status(200).json({ mensagem: "Produto deletado com sucesso" });
   } catch (error) {
     console.error(error);
