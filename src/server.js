@@ -11,6 +11,13 @@ app.get("/", (req, res) => {
 });
 app.use("/produtos", produtoRoutes);
 app.use("/user", usuarioRoutes);
-app.listen(3000, () => {
-  console.log("Servidor rodando na porta 3000");
-});
+
+// Exporta o app para que possa ser usado em outros arquivos, como em testes
+module.exports = app;
+
+// Inicia o servidor apenas se não estiver em ambiente de teste
+if(process.env.NODE_ENV !== "test") {
+  app.listen(3000, () => {
+    console.log("Servidor rodando na porta 3000");
+  });
+}
