@@ -68,10 +68,11 @@ separado do `DATABASE_URL` principal.
 ### Como configurar
 
 1. Copie `.env.example` para `.env` e preencha ambas as URLs de MySQL.
-2. Crie o banco de testes (distinto do principal) e aplique as migrations:
+2. Crie o banco de testes (distinto do principal) e aplique as migrations. No PowerShell, depois de carregar manualmente a URL de teste em `$env:DATABASE_URL_TEST`, execute:
 
 ```bash
-npx dotenv -e .env -- npx prisma migrate deploy
+$env:DATABASE_URL = $env:DATABASE_URL_TEST
+npx prisma migrate deploy
 ```
 
 **Atenção:** o comando acima precisa utilizar o banco **de testes**. Como o
@@ -79,7 +80,7 @@ projeto usa `DATABASE_URL` nas configurações do Prisma, execute a migration
 com `DATABASE_URL` temporariamente apontando para o banco de testes, ou
 use um ambiente dedicado. Nunca aplique uma migration sem conferir a URL.
 
-3. Restaure `DATABASE_URL` principal e execute os testes:
+3. Restaure a URL principal na sessão ou abra um novo terminal e execute os testes:
 
 ```bash
 npm test -- --runInBand
