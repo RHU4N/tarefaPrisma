@@ -10,15 +10,27 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Injeção de dependência do Prisma:
-// 1. Transação isolada por requisição (via cabeçalho x-transaction-id)
-// 2. Transação associada à aplicação (app.get("prisma")) como fallback
-// 3. Cliente padrão do Prisma para execução normal
-app.set("prisma", prisma);
+// Injeção de dependência do Prisma por requisição:
+// - Em ambiente de testes (NODE_ENV=test), inspeciona o cabeçalho x-transaction-id.
+// - Se o cabeçalho for informado, associa o cliente transacional correspondente ou rejeita se for inválido/expirado.
+// - Em ambiente normal ou sem cabeçalho, utiliza exclusivamente o Prisma padrão.
+// - Não há estado global compartilhado (sem app.set("prisma", tx)).
 app.use((req, res, next) => {
-  const txId = req.headers["x-transaction-id"];
-  const tx = obterTransacao(txId);
-  req.prisma = tx || req.app?.get("prisma") || prisma;
+  if (process.env.NODE_ENV === "test") {
+    const txId = req.headers["x-transaction-id"];
+    if (txId) {
+      const tx = obterTransacao(txId);
+      if (!tx) {
+        return res.status(500).json({
+          erro: "Transação de teste não encontrada ou expirada.",
+        });
+      }
+      req.prisma = tx;
+      return next();
+    }
+  }
+
+  req.prisma = prisma;
   next();
 });
 

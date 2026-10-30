@@ -24,20 +24,23 @@ os dados, evitando duplicação entre criar e atualizar.
 
 Os testes unitários ficam em `src/tests/validarUsuario.test.js` e `src/tests/ValidarProduto.test.js`.
 
-Para executar os testes com isolamento:
+Para executar os testes com isolamento e segurança:
 
 ```bash
-# Testes unitários de validação
+# Testes unitários de validação (sem conexão a banco)
 npm run test:unit
 
-# Testes de integração com rollback transacional seguro (preserva dados do banco)
+# Testes de integração com rollback transacional (não destrutivos, preservam dados pré-existentes)
 npm run test:rollback
 
-# Testes de integração legados com limpeza destrutiva (deleteMany)
+# Testes de integração legados com limpeza (DESTRUTIVOS: executam deleteMany() no banco de testes)
 npm run test:clean
 
-# Execução segura padrão (unitários + rollback, sem apagar registros existentes)
+# Execução segura padrão recomendada (unitários + rollback, sem apagar registros existentes)
 npm test
+
+# Executa todas as suítes (ATENÇÃO: inclui os testes legados com deleteMany(), apagando dados do banco de testes)
+npm run test:all
 ```
 
 ## Roteiro manual — Insomnia ou Thunder Client
@@ -67,91 +70,134 @@ npm test
 
 ## A2 — Testes com Rollback
 
-Esta seção documenta a implementação de testes de integração com rollback transacional real utilizando o Prisma ORM e o Supertest, localizados em `src/tests/produtoRollback.test.js` (Produtos) e `src/tests/usuarioRollback.test.js` (Usuários).
+Esta seção documenta a arquitetura de testes de integração com rollback transacional real utilizando o Prisma ORM e o Supertest, localizados em `src/tests/produtoRollback.test.js` (Produtos) e `src/tests/usuarioRollback.test.js` (Usuários).
 
-### 1. Como funciona o `deleteMany()`
-Na abordagem com limpeza manual (como vista em `src/tests/produto.test.js` e `src/tests/usuario.test.js`), um hook `beforeEach()` ou `afterEach()` executa comandos DML de exclusão (`DELETE FROM Produto` / `DELETE FROM Usuario`) diretamente no banco de dados para esvaziar a tabela antes ou após cada teste.
+---
 
-### 2. Por que `deleteMany()` não é rollback
-- **Exclusão destrutiva:** Em vez de restaurar o banco ao estado original, o `deleteMany()` elimina fisicamente todos os registros da tabela. Se o banco possuía dados pré-existentes (de homologação, desenvolvimento ou sementes de teste), esses dados são permanentemente apagados.
-- **Não reversão de alterações:** Se um teste executa `UPDATE` ou `DELETE` em um registro existente, o `deleteMany()` não desfaz a alteração para voltar ao valor anterior; ele simplesmente apaga a tabela por completo.
-- **Risco de efeitos colaterais:** Não oferece isolamento atômico caso o processo seja interrompido abruptamente, deixando o banco vazio.
+### 1. Diferença entre limpeza (`deleteMany`) e rollback transacional
 
-### 3. Como funciona o `$transaction()`
-O Prisma oferece transações interativas através do método `$transaction(async (tx) => { ... })`:
-- Ao ser invocado, o Prisma inicia uma transação real no banco de dados (`START TRANSACTION`).
-- Um cliente transacional (`tx`) exclusivo é fornecido para o callback. Qualquer consulta ou mutação executada através de `tx` participa estritamente daquela transação.
-- **Decisão de Commit ou Rollback:** Se o callback for concluído normalmente, o Prisma envia `COMMIT`. Caso uma exceção seja disparada (rejeição da Promise), o Prisma envia `ROLLBACK` ao banco MySQL.
-
-### 4. Como o rollback restaura os registros anteriores
-O mecanismo de armazenamento do MySQL (InnoDB) utiliza logs de reversão (*undo logs*). Ao receber o comando `ROLLBACK`:
-- Quaisquer `INSERT` efetuados na transação são descartados.
-- Quaisquer `UPDATE` têm seus valores anteriores restaurados a partir dos logs de undo.
-- Quaisquer `DELETE` têm suas linhas recuperadas integralmente.
-
-> **Importante sobre escopo e `AUTO_INCREMENT`:** O rollback transacional garante estritamente a preservação do **conteúdo dos registros e seus dados relacionais**. Ele **não** restaura o contador interno de `AUTO_INCREMENT` no MySQL InnoDB, pois a alocação de IDs sequenciais é gerida fora da transação para evitar gargalos de concorrência. Portanto, IDs consumidos durante inserções revertidas não são reciclados pelo banco de dados.
-
-Para garantir o rollback ao término de cada teste com sucesso, utiliza-se a estratégia de **rollback intencional**:
-- As fixtures necessárias para o teste são criadas **dentro** da própria transação (`tx`).
-- O teste executa as requisições HTTP reais com Supertest e as asserções do Jest.
-- No final do callback da transação, lança-se propositalmente um erro especial (`RollbackIntencionalError`).
-- O Prisma intercepta o erro e executa o `ROLLBACK` no MySQL.
-- O helper de teste trata o erro intencional como sucesso e relança apenas erros legítimos de falha de teste (ex.: asserções do Jest).
-- Em caso de falha de asserção, o erro é relançado forçando o `ROLLBACK` no banco e sendo reportado pelo Jest.
-
-### 5. Integração com Supertest e Injeção de Dependência por Requisição
-Para que requisições disparadas pelo Supertest participem da transação ativa sem conflito de concorrência ou estado global:
-- Em `src/config/prisma.js`, é mantido um registro de transações ativas mapeado por ID (`transacoesAtivas = new Map()`).
-- No `server.js`, um middleware inspeciona o cabeçalho HTTP `x-transaction-id`:
-  ```javascript
-  app.use((req, res, next) => {
-    const txId = req.headers["x-transaction-id"];
-    const tx = obterTransacao(txId);
-    req.prisma = tx || req.app?.get("prisma") || prisma;
-    next();
-  });
-  ```
-- Nos controllers (`ProdutoController.js` e `UsuarioController.js`), as funções de rota obtêm o Prisma via `req.prisma || req.app?.get("prisma") || defaultPrisma`.
-- Durante cada teste, é gerado um UUID único (`transacaoId`). O cliente HTTP de teste injeta automaticamente `x-transaction-id: transacaoId`.
-- Isso garante **isolamento total por requisição**, prevenindo race conditions entre testes concorrentes e preservando o comportamento original da API.
-
-### 6. Como comprovar o rollback com evidências
-Em `produtoRollback.test.js` e `usuarioRollback.test.js`, a preservação dos dados é comprovada com as seguintes evidências automatizadas:
-1. **Snapshot pré e pós-teste:** Captura-se `findMany({ orderBy: { id: "asc" } })` antes da transação e compara-se após o rollback (`expect(depois).toEqual(antes)`).
-2. **Evidência de POST:** O registro é consultado dentro de `tx` confirmando sua criação, e consultado fora da transação após o rollback confirmando que `findUnique` retorna `null`.
-3. **Evidência de PUT:** O registro é alterado temporariamente via HTTP dentro de `tx`, e após o rollback confirma-se que seus valores foram restaurados aos originais.
-4. **Evidência de DELETE:** O registro é excluído via HTTP dentro de `tx`, e após o rollback confirma-se que ele continua existindo no banco.
-5. **Evidência em caso de falha:** Um teste de falha deliberada confirma que mesmo quando uma asserção falha, o rollback ocorre e os dados permanecem intactos.
-
-### 7. Limpeza vs. Rollback Transacional
-
-| Critério | Limpeza (`deleteMany`) | Rollback Transacional (`$transaction`) |
+| Aspecto | Limpeza Manual (`deleteMany()`) | Rollback Transacional (`$transaction()`) |
 | :--- | :--- | :--- |
-| **Preservação de dados pré-existentes** | ❌ Não preserva (apaga permanentemente) |  Preserva 100% dos registros anteriores |
-| **Mecanismo utilizado** | Comandos DML `DELETE` explícitos fora de tx | Mecanismo nativo de transação ACID (`ROLLBACK`) |
-| **Comportamento em Updates/Deletes** | Destrói os dados em vez de restaurar | Restaura valores alterados e linhas excluídas |
-| **Impacto no `AUTO_INCREMENT`** | Consome novos IDs a cada exclusão em massa | IDs consumidos em inserts revertidos não são reciclados |
-| **Garantia de integridade** | Nenhuma (dados apagados se o teste falhar) | Atômica (reverte até mesmo em caso de erro) |
-| **Velocidade e I/O** | Lento (múltiplas gravações e exclusões em disco) | Rápido (reversão em memória/undo log) |
-| **Segurança para dados prévios** | ⚠️ Alto risco de perda de dados | 🛡️ Seguro, isolado e atômico |
+| **Comportamento** | Executa `DELETE FROM tabela` via DML antes ou depois do teste. | Inicia uma transação com `START TRANSACTION` e emite `ROLLBACK` ao final. |
+| **Dados pré-existentes** | São **destruídos permanentemente** a cada teste executado. | São **preservados**: a tabela retorna ao estado exato do snapshot inicial. |
+| **Alterações (`UPDATE`)** | Não reverte o dado modificado para o valor original; apaga tudo. | Reverte valores alterados de volta aos valores originais via *undo log*. |
+| **Exclusões (`DELETE`)** | Não restaura registros excluídos durante o teste. | Restaura os registros excluídos de volta ao banco. |
+| **Falha no teste** | Se a asserção falhar, a tabela pode ficar parcialmente corrompida. | O rollback é executado automaticamente, mesmo se uma asserção falhar. |
+| **I/O e Desempenho** | Lento devido a sucessivas gravações e deleções físicas em disco. | Rápido, aproveitando buffers de memória e undo logs da engine. |
 
-### 8. Scripts e Comandos de Execução
+---
 
-No `package.json`, os comandos foram separados para garantir execuções seguras e não destrutivas:
+### 2. Como o Prisma utiliza o `$transaction()`
 
-```bash
-# Executa apenas testes unitários de validação (sem acesso ao banco)
-npm run test:unit
-
-# Executa apenas testes de integração com rollback transacional (seguro)
-npm run test:rollback
-
-# Executa testes legados com limpeza destrutiva (atenção: apaga dados de Produto e Usuario)
-npm run test:clean
-
-# Execução segura padrão (unitários + rollback, sem apagar registros prévios)
-npm test
-
-# Executa todas as suítes em sequência
-npm run test:all
+O Prisma ORM disponibiliza o recurso de **transações interativas**:
+```javascript
+await prisma.$transaction(async (tx) => {
+  // tx é uma instância exclusiva ligada à conexão aberta para esta transação
+  await tx.produto.create({ ... });
+  // Se a função lançar uma exceção, o Prisma envia ROLLBACK ao MySQL.
+  // Se concluir normalmente, envia COMMIT.
+}, { maxWait: 10000, timeout: 20000 });
 ```
+
+Para implementar o rollback sem comitar dados de teste, adota-se a técnica de **rollback intencional**:
+- Ao final das asserções válidas do teste, a função lança propositalmente uma exceção controlada (`RollbackIntencionalError`).
+- O Prisma intercepta a exceção e emite o comando `ROLLBACK` ao MySQL.
+- O helper de teste trata o erro intencional como condição de sucesso e confirma que os registros pós-teste coincidem com os pré-teste.
+
+---
+
+### 3. Compartilhamento da transação com Supertest por requisição
+
+Em testes de integração com Supertest, as requisições HTTP atingem a aplicação Express de forma desacoplada da chamada do teste.
+
+Para associar a requisição HTTP à transação sem recorrer a estado global compartilhado:
+1. Em `src/config/prisma.js`, é mantido um registro em memória (`Map`) que associa um UUID único ao cliente transacional `tx`:
+   - `registrarTransacao(id, tx)`
+   - `obterTransacao(id)`
+   - `removerTransacao(id)`
+2. O helper de teste gera um UUID (`transacaoId`) para cada teste e configura o cliente HTTP para enviar o cabeçalho:
+   ```http
+   x-transaction-id: <transacaoId>
+   ```
+3. O middleware em `src/server.js` extrai o cabeçalho e injeta o cliente transacional na requisição:
+   ```javascript
+   req.prisma = tx;
+   ```
+4. Os controllers acessam `req.prisma`, executando todas as consultas no escopo da transação ativa.
+
+---
+
+### 4. Isolamento por UUID e Segurança contra Vazamento
+
+- **Exclusividade em ambiente de teste:** O cabeçalho `x-transaction-id` é interpretado **somente** quando `process.env.NODE_ENV === "test"`. Em produção ou desenvolvimento, cabeçalhos externos são ignorados e a aplicação utiliza exclusivamente o Prisma padrão.
+- **Rejeição de identificadores inválidos:** No ambiente de teste, se uma requisição fornecer um identificador inexistente ou expirado, ela é rejeitada imediatamente com status `500` (`Transação de teste não encontrada ou expirada.`). Isso impede que requisições de teste realizem gravações acidentais no banco fora da transação.
+- **Limpeza no bloco `finally`:** O identificador da transação é removido do `Map` no bloco `finally` de `executarComRollback`, prevenindo vazamento de conexões ou transações órfãs mesmo em caso de erro grave.
+- **Ausência de estado global:** Não é utilizado `app.set("prisma", tx)` nem variáveis globais mutáveis na aplicação Express, permitindo isolamento individual por requisição.
+
+---
+
+### 5. Como ocorre o rollback após falhas
+
+Se uma asserção do Jest falhar durante o teste (`expect(res.statusCode).toBe(201)` recebendo outro código):
+1. O Jest lança um `JestAssertionError`.
+2. O helper `executarComRollback` intercepta o erro e o relança dentro do callback do `$transaction`.
+3. O Prisma detecta a exceção e dispara o `ROLLBACK` no MySQL.
+4. O helper captura a exceção no bloco externo, verifica que a tabela voltou ao estado original (`expect(depoisFalha).toEqual(antes)`) e relança o erro original da asserção com seu rastreamento intacto para o Jest registrar a falha do teste.
+
+---
+
+### 6. Como testar a restauração de registros pré-existentes
+
+Os testes em `produtoRollback.test.js` e `usuarioRollback.test.js` cobrem dois tipos de validação:
+
+1. **Fixtures criadas dentro da transação:** Criação, leitura, atualização e exclusão de itens dentro do escopo transacional, comprovando que após o rollback esses registros deixam de existir no banco.
+2. **Registros pré-existentes no banco de testes:**
+   - **Cenário de `PUT`:** Consulta o primeiro registro pré-existente no banco de testes, altera seu valor via API dentro da transação, confirma a alteração em `tx`, executa rollback e confirma que os valores originais foram restaurados com exatidão (`toEqual(dadosOriginais)`).
+   - **Cenário de `DELETE`:** Consulta o primeiro registro pré-existente, exclui-o via API dentro da transação, confirma que ele retornou `null` em `tx`, executa rollback e confirma que o registro continua existindo no banco com todos os seus atributos originais.
+
+> **Aviso sobre bases vazias:** Se a tabela estiver vazia no momento da execução (por exemplo, após rodar `npm run test:clean`), os testes de registros pré-existentes sinalizam explicitamente via console: `[AVISO] CENÁRIO NÃO VALIDADO: Nenhum produto preexistente encontrado...`. Para validar esses cenários, consulte a seção 9 abaixo sobre preparação de dados.
+
+---
+
+### 7. Por que o `AUTO_INCREMENT` pode continuar avançando após o rollback
+
+No motor de armazenamento MySQL InnoDB, a sequência de `AUTO_INCREMENT` é gerenciada em memória por um mecanismo de alocação de IDs desacoplado do *undo log* das transações. Isso é feito deliberadamente pelo MySQL para evitar gargalos e bloqueios concorrentes em sistemas de alta vazão.
+
+Consequentemente:
+- Se uma transação insere um registro recebendo o ID `10` e a transação é revertida por `ROLLBACK`, o ID `10` **não é reutilizado**.
+- A próxima inserção receberá o ID `11`.
+- O rollback transacional garante a restauração e integridade das **linhas, colunas e dados relacionais da tabela**, mas **não reverte contadores internos de sequência do banco de dados**.
+
+---
+
+### 8. Como executar separadamente cada grupo de testes
+
+| Comando | Descrição | Segurança dos Dados |
+| :--- | :--- | :--- |
+| `npm run test:unit` | Executa testes unitários de regras de validação. | **Seguro:** não acessa o banco de dados. |
+| `npm run test:rollback` | Executa testes de integração com rollback transacional em Produto e Usuário. | **Seguro:** reverte todas as mutações via transação. |
+| `npm test` | Execução padrão recomendada (unitários + rollback). | **Seguro:** valida a aplicação sem apagar dados prévios. |
+| `npm run test:clean` | Executa testes legados com `deleteMany()`. | ⚠️ **Destrutivo:** apaga dados das tabelas de teste. |
+| `npm run test:all` | Executa todas as suítes existentes sequencialmente. | ⚠️ **Destrutivo:** inclui as suítes legadas de limpeza. |
+
+---
+
+### 9. Como preparar dados e verificar evidências
+
+Para verificar a restauração de dados pré-existentes com evidências concretas:
+
+1. **Inserir dados prévios no banco de testes (`loja_teste`):**
+   ```bash
+   node -e 'require("dotenv").config(); const { PrismaClient } = require("@prisma/client"); const p = new PrismaClient({ datasources: { db: { url: process.env.DATABASE_URL_TEST } } }); Promise.all([p.produto.create({ data: { nome: "Monitor 4K Preexistente", preco: 2500, quantidade: 3 } }), p.usuario.create({ data: { nome: "User Preexistente", telefone: "11988887777", email: "pre@teste.com", senha: "senhaValida123" } })]).then(() => console.log("Dados inseridos com sucesso!")).finally(() => p.$disconnect());'
+   ```
+
+2. **Executar a suíte de rollback:**
+   ```bash
+   npm run test:rollback
+   ```
+
+3. **Inspecionar a persistência pós-teste:**
+   ```bash
+   node -e 'require("dotenv").config(); const { PrismaClient } = require("@prisma/client"); const p = new PrismaClient({ datasources: { db: { url: process.env.DATABASE_URL_TEST } } }); Promise.all([p.produto.findMany(), p.usuario.findMany()]).then(([prods, users]) => console.log({ produtos: prods.length, usuarios: users.length })).finally(() => p.$disconnect());'
+   ```
+   Os registros inseridos no passo 1 permanecem presentes e com os mesmos valores, comprovando o rollback integral das operações de `POST`, `PUT` e `DELETE`.

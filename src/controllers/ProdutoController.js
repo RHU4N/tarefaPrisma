@@ -1,9 +1,9 @@
 const defaultPrisma = require("../config/prisma");
 const validarProduto = require("../utils/validarProduto");
 
-// Permite obter o cliente Prisma da requisição (injetado via middleware/app) ou o padrão
+// Permite obter o cliente Prisma da requisição (injetado via middleware) ou o padrão
 function getPrisma(req) {
-  return req?.prisma || req?.app?.get("prisma") || defaultPrisma;
+  return req?.prisma || defaultPrisma;
 }
 
 // LISTAR TODOS
