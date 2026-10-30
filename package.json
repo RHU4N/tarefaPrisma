@@ -4,7 +4,11 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "jest",
+    "test": "jest src/tests/ValidarProduto.test.js src/tests/validarUsuario.test.js src/tests/produtoRollback.test.js src/tests/usuarioRollback.test.js --runInBand",
+    "test:all": "jest --runInBand",
+    "test:unit": "jest src/tests/ValidarProduto.test.js src/tests/validarUsuario.test.js",
+    "test:clean": "jest src/tests/produto.test.js src/tests/usuario.test.js --runInBand",
+    "test:rollback": "jest src/tests/produtoRollback.test.js src/tests/usuarioRollback.test.js --runInBand",
     "dev": "npx nodemon src/server.js",
     "prisma": "prisma"
   },

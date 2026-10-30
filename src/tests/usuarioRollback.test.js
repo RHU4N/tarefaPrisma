@@ -1,4 +1,5 @@
 require("dotenv").config();
+const crypto = require("crypto");
 
 // 1. SEGURANÇA: validação rigorosa dos bancos de dados
 const bancoPrincipal = process.env.DATABASE_URL;
@@ -29,6 +30,7 @@ process.env.DATABASE_URL = bancoTeste;
 const request = require("supertest");
 const app = require("../server");
 const prisma = require("../config/prisma");
+const { registrarTransacao, removerTransacao } = require("../config/prisma");
 
 jest.setTimeout(30000);
 
@@ -40,104 +42,119 @@ class RollbackIntencionalError extends Error {
 }
 
 /**
+ * Cria cliente HTTP isolado por requisição associando o ID da transação
+ * através do cabeçalho x-transaction-id, evitando concorrência e estado global.
+ */
+function criarClienteHttp(appInstance, transacaoId) {
+  return {
+    get: (url) => request(appInstance).get(url).set("x-transaction-id", transacaoId),
+    post: (url) => request(appInstance).post(url).set("x-transaction-id", transacaoId),
+    put: (url) => request(appInstance).put(url).set("x-transaction-id", transacaoId),
+    delete: (url) => request(appInstance).delete(url).set("x-transaction-id", transacaoId),
+  };
+}
+
+/**
  * Executa uma ação de teste dentro de uma transação interativa real do Prisma ($transaction).
- * Compartilha o cliente transacional (tx) com o Express para que requisições do Supertest
- * operem na mesma transação. Ao final, força o rollback intencional e garante que
- * o estado anterior da tabela Usuario seja 100% preservado.
+ * - Registra snapshot inicial da tabela Usuario.
+ * - Injeta o cliente transacional por requisição (x-transaction-id) com fallback no app.
+ * - Executa a ação HTTP do teste.
+ * - Ao concluir com sucesso, força o rollback intencional.
+ * - Em caso de falha de asserção, garante o rollback e propaga o erro para o Jest.
+ * - Confirma que todos os registros anteriores foram rigorosamente preservados.
  */
 async function executarComRollback(acao) {
-  // Snapshot dos registros existentes antes da execução do teste
+  const transacaoId = crypto.randomUUID();
   const usuariosAntes = await prisma.usuario.findMany({ orderBy: { id: "asc" } });
   let erroDoTeste = null;
 
   try {
     await prisma.$transaction(
       async (tx) => {
-        // Injeta o cliente transacional no app Express
+        registrarTransacao(transacaoId, tx);
         app.set("prisma", tx);
         try {
-          await acao(tx);
+          const http = criarClienteHttp(app, transacaoId);
+          await acao(tx, http);
         } catch (err) {
-          // Captura erro de teste legítimo (ex.: falha de asserção do Jest)
           erroDoTeste = err;
           throw err; // Força rollback no Prisma
         } finally {
-          // Restaura a instância padrão do Prisma no app
+          removerTransacao(transacaoId);
           app.set("prisma", prisma);
         }
 
-        // Se o teste passou, força o rollback intencional para descartar as alterações
+        // Se o teste passou pelas asserções, força o rollback intencional
         throw new RollbackIntencionalError();
       },
       { maxWait: 10000, timeout: 20000 }
     );
   } catch (erro) {
     if (erro instanceof RollbackIntencionalError || erro.name === "RollbackIntencionalError") {
-      // Rollback intencional executado com sucesso
+      // Rollback intencional esperado
     } else if (erroDoTeste) {
-      // Erro legítimo do teste: repassa para o Jest reportar a falha
+      // Comprova que mesmo na falha do teste o rollback preservou o banco
+      const usuariosDepoisFalha = await prisma.usuario.findMany({ orderBy: { id: "asc" } });
+      expect(usuariosDepoisFalha).toEqual(usuariosAntes);
       throw erroDoTeste;
     } else {
-      // Erro inesperado do banco ou da transação
       throw erro;
     }
   } finally {
+    removerTransacao(transacaoId);
     app.set("prisma", prisma);
   }
 
-  // Comprova que todos os registros anteriores foram rigorosamente preservados
+  // Comprova que todos os registros anteriores foram 100% preservados
   const usuariosDepois = await prisma.usuario.findMany({ orderBy: { id: "asc" } });
   expect(usuariosDepois).toEqual(usuariosAntes);
 }
 
 describe("Testes de integração com rollback transacional real (Usuario)", () => {
-  let usuarioPreExistente;
-
-  beforeAll(async () => {
-    // Garante ao menos um registro pré-existente no banco antes dos testes
-    // para comprovar que o rollback não exclui nem corrompe dados prévios
-    const existentes = await prisma.usuario.findMany({ orderBy: { id: "asc" } });
-    if (existentes.length === 0) {
-      usuarioPreExistente = await prisma.usuario.create({
-        data: {
-          nome: "Carlos Eduardo",
-          telefone: "11987654321",
-          email: "carlos.base@email.com",
-          senha: "senhaSegura123",
-        },
-      });
-    } else {
-      usuarioPreExistente = existentes[0];
-    }
-  });
-
   afterAll(async () => {
-    // Se o registro foi criado exclusivamente para a suíte, limpa apenas ele
-    if (usuarioPreExistente) {
-      await prisma.usuario.delete({ where: { id: usuarioPreExistente.id } }).catch(() => {});
-    }
+    // Nunca executa deleteMany(), TRUNCATE ou exclusões fora de transações.
+    // Todas as fixtures são criadas e revertidas dentro de transações individuais.
     await prisma.$disconnect();
   });
 
   test("GET /user deve listar usuários dentro da transação preservando dados", async () => {
-    await executarComRollback(async () => {
-      const response = await request(app).get("/user");
+    await executarComRollback(async (tx, http) => {
+      // Fixture criada dentro da transação para garantir conteúdo na lista
+      const fixture = await tx.usuario.create({
+        data: {
+          nome: "Usuario Fixture GET",
+          telefone: "11987654321",
+          email: "fixture.get@email.com",
+          senha: "senhaSegura123",
+        },
+      });
+
+      const response = await http.get("/user");
 
       expect(response.statusCode).toBe(200);
       expect(Array.isArray(response.body)).toBe(true);
-      expect(response.body.length).toBeGreaterThan(0);
-      expect(response.body.some((u) => u.id === usuarioPreExistente.id)).toBe(true);
+      expect(response.body.some((u) => u.id === fixture.id)).toBe(true);
     });
   });
 
   test("GET /user/:id deve retornar o usuário correto dentro da transação", async () => {
-    await executarComRollback(async () => {
-      const response = await request(app).get(`/user/${usuarioPreExistente.id}`);
+    await executarComRollback(async (tx, http) => {
+      // Fixture criada dentro da própria transação
+      const fixture = await tx.usuario.create({
+        data: {
+          nome: "Usuario Busca ID",
+          telefone: "11911112222",
+          email: "busca.id@email.com",
+          senha: "senhaSegura123",
+        },
+      });
+
+      const response = await http.get(`/user/${fixture.id}`);
 
       expect(response.statusCode).toBe(200);
-      expect(response.body.id).toBe(usuarioPreExistente.id);
-      expect(response.body.nome).toBe(usuarioPreExistente.nome);
-      expect(response.body.email).toBe(usuarioPreExistente.email);
+      expect(response.body.id).toBe(fixture.id);
+      expect(response.body.nome).toBe(fixture.nome);
+      expect(response.body.email).toBe(fixture.email);
     });
   });
 
@@ -150,8 +167,8 @@ describe("Testes de integração com rollback transacional real (Usuario)", () =
       senha: "minhaSenhaForte",
     };
 
-    await executarComRollback(async (tx) => {
-      const response = await request(app).post("/user").send(novoUsuario);
+    await executarComRollback(async (tx, http) => {
+      const response = await http.post("/user").send(novoUsuario);
 
       expect(response.statusCode).toBe(201);
       expect(response.body.nome).toBe(novoUsuario.nome);
@@ -160,7 +177,7 @@ describe("Testes de integração com rollback transacional real (Usuario)", () =
 
       idCriado = response.body.id;
 
-      // Confirmação DENTRO da transação: o usuário foi gravado no escopo de tx
+      // Evidência DENTRO da transação: o usuário existe no escopo de tx
       const gravadoNaTx = await tx.usuario.findUnique({
         where: { id: idCriado },
       });
@@ -168,7 +185,7 @@ describe("Testes de integração com rollback transacional real (Usuario)", () =
       expect(gravadoNaTx.nome).toBe(novoUsuario.nome);
     });
 
-    // Confirmação FORA da transação: após o rollback, o registro NÃO existe no banco
+    // Evidência FORA da transação: após o rollback, o registro NÃO existe no banco
     const gravadoAposRollback = await prisma.usuario.findUnique({
       where: { id: idCriado },
     });
@@ -176,8 +193,8 @@ describe("Testes de integração com rollback transacional real (Usuario)", () =
   });
 
   test("POST /user deve rejeitar dados inválidos com status 400", async () => {
-    await executarComRollback(async () => {
-      const response = await request(app).post("/user").send({
+    await executarComRollback(async (_tx, http) => {
+      const response = await http.post("/user").send({
         nome: "",
         telefone: "11912345678",
         email: "email@valido.com",
@@ -189,65 +206,81 @@ describe("Testes de integração com rollback transacional real (Usuario)", () =
     });
   });
 
-  test("PUT /user/:id deve atualizar usuário na transação e restaurar valores no rollback", async () => {
-    const nomeOriginal = usuarioPreExistente.nome;
-    const telefoneOriginal = usuarioPreExistente.telefone;
-    const emailOriginal = usuarioPreExistente.email;
-    const senhaOriginal = usuarioPreExistente.senha;
+  test("PUT /user/:id deve atualizar fixture dentro da transação e restaurar no rollback", async () => {
+    let idFixture;
 
-    await executarComRollback(async (tx) => {
-      const response = await request(app)
-        .put(`/user/${usuarioPreExistente.id}`)
-        .send({
-          nome: "Carlos Atualizado Temporariamente",
+    await executarComRollback(async (tx, http) => {
+      // Fixture criada estritamente dentro da transação
+      const fixture = await tx.usuario.create({
+        data: {
+          nome: "Carlos Original",
           telefone: "11988887777",
+          email: "carlos.orig@email.com",
+          senha: "senhaAntiga123",
+        },
+      });
+      idFixture = fixture.id;
+
+      const response = await http
+        .put(`/user/${idFixture}`)
+        .send({
+          nome: "Carlos Alterado",
+          telefone: "11999990000",
           email: "carlos.alterado@email.com",
-          senha: "novaSenha1234",
+          senha: "novaSenhaForte",
         });
 
       expect(response.statusCode).toBe(200);
-      expect(response.body.nome).toBe("Carlos Atualizado Temporariamente");
+      expect(response.body.nome).toBe("Carlos Alterado");
       expect(response.body.email).toBe("carlos.alterado@email.com");
 
-      // Confirmação DENTRO da transação: os dados foram alterados no escopo de tx
+      // Evidência DENTRO da transação: os dados foram alterados no escopo de tx
       const naTx = await tx.usuario.findUnique({
-        where: { id: usuarioPreExistente.id },
+        where: { id: idFixture },
       });
-      expect(naTx.nome).toBe("Carlos Atualizado Temporariamente");
+      expect(naTx.nome).toBe("Carlos Alterado");
       expect(naTx.email).toBe("carlos.alterado@email.com");
     });
 
-    // Confirmação FORA da transação: após o rollback, o registro reassume os dados originais
-    const restaurado = await prisma.usuario.findUnique({
-      where: { id: usuarioPreExistente.id },
+    // Evidência FORA da transação: a fixture inteira foi revertida pelo rollback
+    const aposRollback = await prisma.usuario.findUnique({
+      where: { id: idFixture },
     });
-    expect(restaurado.nome).toBe(nomeOriginal);
-    expect(restaurado.telefone).toBe(telefoneOriginal);
-    expect(restaurado.email).toBe(emailOriginal);
-    expect(restaurado.senha).toBe(senhaOriginal);
+    expect(aposRollback).toBeNull();
   });
 
-  test("DELETE /user/:id deve excluir usuário na transação e restaurá-lo no rollback", async () => {
-    await executarComRollback(async (tx) => {
-      const response = await request(app).delete(`/user/${usuarioPreExistente.id}`);
+  test("DELETE /user/:id deve excluir fixture dentro da transação e reverter no rollback", async () => {
+    let idFixture;
+
+    await executarComRollback(async (tx, http) => {
+      // Fixture criada estritamente dentro da transação
+      const fixture = await tx.usuario.create({
+        data: {
+          nome: "Usuario Para Deletar",
+          telefone: "11922223333",
+          email: "deletar@email.com",
+          senha: "senhaDeletar123",
+        },
+      });
+      idFixture = fixture.id;
+
+      const response = await http.delete(`/user/${idFixture}`);
 
       expect(response.statusCode).toBe(200);
       expect(response.body.message).toBe("Usuário deletado com sucesso");
 
-      // Confirmação DENTRO da transação: usuário não existe no escopo de tx
+      // Evidência DENTRO da transação: usuário não existe no escopo de tx
       const naTx = await tx.usuario.findUnique({
-        where: { id: usuarioPreExistente.id },
+        where: { id: idFixture },
       });
       expect(naTx).toBeNull();
     });
 
-    // Confirmação FORA da transação: após o rollback, o usuário excluído voltou a existir intacto
-    const restaurado = await prisma.usuario.findUnique({
-      where: { id: usuarioPreExistente.id },
+    // Evidência FORA da transação: a fixture inteira foi revertida pelo rollback
+    const aposRollback = await prisma.usuario.findUnique({
+      where: { id: idFixture },
     });
-    expect(restaurado).not.toBeNull();
-    expect(restaurado.id).toBe(usuarioPreExistente.id);
-    expect(restaurado.nome).toBe(usuarioPreExistente.nome);
+    expect(aposRollback).toBeNull();
   });
 
   test("Garante que o rollback de usuário é executado mesmo se o teste falhar", async () => {
@@ -255,8 +288,8 @@ describe("Testes de integração com rollback transacional real (Usuario)", () =
 
     let erroCapturado = null;
     try {
-      await executarComRollback(async () => {
-        await request(app).post("/user").send({
+      await executarComRollback(async (_tx, http) => {
+        await http.post("/user").send({
           nome: "Usuario Nao Persistido",
           telefone: "11999999999",
           email: "falha@email.com",
@@ -270,10 +303,9 @@ describe("Testes de integração com rollback transacional real (Usuario)", () =
       erroCapturado = err;
     }
 
-    // Comprova que a asserção falhou e foi capturada, mas a tabela permaneceu intacta
+    // Comprova que a asserção falhou e foi capturada, mas a tabela permaneceu 100% intacta
     expect(erroCapturado).not.toBeNull();
     const depois = await prisma.usuario.findMany({ orderBy: { id: "asc" } });
     expect(depois).toEqual(antes);
   });
 });
-

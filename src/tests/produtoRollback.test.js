@@ -1,4 +1,5 @@
 require("dotenv").config();
+const crypto = require("crypto");
 
 // 1. SEGURANÇA: validação rigorosa dos bancos de dados
 const bancoPrincipal = process.env.DATABASE_URL;
@@ -29,6 +30,7 @@ process.env.DATABASE_URL = bancoTeste;
 const request = require("supertest");
 const app = require("../server");
 const prisma = require("../config/prisma");
+const { registrarTransacao, removerTransacao } = require("../config/prisma");
 
 jest.setTimeout(30000);
 
@@ -40,97 +42,102 @@ class RollbackIntencionalError extends Error {
 }
 
 /**
+ * Cria cliente HTTP isolado por requisição associando o ID da transação
+ * através do cabeçalho x-transaction-id, evitando concorrência e estado global.
+ */
+function criarClienteHttp(appInstance, transacaoId) {
+  return {
+    get: (url) => request(appInstance).get(url).set("x-transaction-id", transacaoId),
+    post: (url) => request(appInstance).post(url).set("x-transaction-id", transacaoId),
+    put: (url) => request(appInstance).put(url).set("x-transaction-id", transacaoId),
+    delete: (url) => request(appInstance).delete(url).set("x-transaction-id", transacaoId),
+  };
+}
+
+/**
  * Executa uma ação de teste dentro de uma transação interativa real do Prisma ($transaction).
- * Compartilha o cliente transacional (tx) com o Express para que requisições do Supertest
- * operem na mesma transação. Ao final, força o rollback intencional e garante que
- * o estado anterior da tabela Produto seja 100% preservado.
+ * - Registra snapshot inicial da tabela Produto.
+ * - Injeta o cliente transacional por requisição (x-transaction-id) com fallback no app.
+ * - Executa a ação HTTP do teste.
+ * - Ao concluir com sucesso, força o rollback intencional.
+ * - Em caso de falha de asserção, garante o rollback e propaga o erro para o Jest.
+ * - Confirma que todos os registros anteriores foram rigorosamente preservados.
  */
 async function executarComRollback(acao) {
-  // Snapshot dos registros existentes antes da execução do teste
+  const transacaoId = crypto.randomUUID();
   const produtosAntes = await prisma.produto.findMany({ orderBy: { id: "asc" } });
   let erroDoTeste = null;
 
   try {
     await prisma.$transaction(
       async (tx) => {
-        // Injeta o cliente transacional no app Express
+        registrarTransacao(transacaoId, tx);
         app.set("prisma", tx);
         try {
-          await acao(tx);
+          const http = criarClienteHttp(app, transacaoId);
+          await acao(tx, http);
         } catch (err) {
-          // Captura erro de teste legítimo (ex.: falha de asserção do Jest)
           erroDoTeste = err;
           throw err; // Força rollback no Prisma
         } finally {
-          // Restaura a instância padrão do Prisma no app
+          removerTransacao(transacaoId);
           app.set("prisma", prisma);
         }
 
-        // Se o teste passou, força o rollback intencional para descartar as alterações
+        // Se o teste passou pelas asserções, força o rollback intencional
         throw new RollbackIntencionalError();
       },
       { maxWait: 10000, timeout: 20000 }
     );
   } catch (erro) {
     if (erro instanceof RollbackIntencionalError || erro.name === "RollbackIntencionalError") {
-      // Rollback intencional executado com sucesso
+      // Rollback intencional esperado
     } else if (erroDoTeste) {
-      // Erro legítimo do teste: repassa para o Jest reportar a falha
+      // Comprova que mesmo na falha do teste o rollback preservou o banco
+      const produtosDepoisFalha = await prisma.produto.findMany({ orderBy: { id: "asc" } });
+      expect(produtosDepoisFalha).toEqual(produtosAntes);
       throw erroDoTeste;
     } else {
-      // Erro inesperado do banco ou da transação
       throw erro;
     }
   } finally {
+    removerTransacao(transacaoId);
     app.set("prisma", prisma);
   }
 
-  // Comprova que todos os registros anteriores foram rigorosamente preservados
+  // Comprova que todos os registros anteriores foram 100% preservados
   const produtosDepois = await prisma.produto.findMany({ orderBy: { id: "asc" } });
   expect(produtosDepois).toEqual(produtosAntes);
 }
 
 describe("Testes de integração com rollback transacional real (Produto)", () => {
-  let produtoPreExistente;
-
-  beforeAll(async () => {
-    // Garante ao menos um registro pré-existente no banco antes dos testes
-    // para comprovar que o rollback não exclui nem corrompe dados prévios
-    const existentes = await prisma.produto.findMany({ orderBy: { id: "asc" } });
-    if (existentes.length === 0) {
-      produtoPreExistente = await prisma.produto.create({
-        data: {
-          nome: "Monitor UltraWide",
-          descricao: "IPS 34 polegadas",
-          preco: 2499.9,
-          quantidade: 5,
-        },
-      });
-    } else {
-      produtoPreExistente = existentes[0];
-    }
-  });
-
   afterAll(async () => {
-    // Se o registro foi criado exclusivamente para a suíte, limpa apenas ele
-    if (produtoPreExistente) {
-      await prisma.produto.delete({ where: { id: produtoPreExistente.id } }).catch(() => {});
-    }
+    // Nunca executa deleteMany(), TRUNCATE ou exclusões fora de transações.
+    // Todas as fixtures são criadas e revertidas dentro de transações individuais.
     await prisma.$disconnect();
   });
 
   test("GET /produtos deve listar produtos dentro da transação preservando dados", async () => {
-    await executarComRollback(async () => {
-      const response = await request(app).get("/produtos");
+    await executarComRollback(async (tx, http) => {
+      // Fixture criada dentro da própria transação para garantir que a lista não esteja vazia
+      const fixture = await tx.produto.create({
+        data: {
+          nome: "Produto Fixture GET",
+          descricao: "Criado dentro da transacao",
+          preco: 50.0,
+          quantidade: 1,
+        },
+      });
+
+      const response = await http.get("/produtos");
 
       expect(response.statusCode).toBe(200);
       expect(Array.isArray(response.body)).toBe(true);
-      expect(response.body.length).toBeGreaterThan(0);
-      expect(response.body.some((p) => p.id === produtoPreExistente.id)).toBe(true);
+      expect(response.body.some((p) => p.id === fixture.id)).toBe(true);
     });
   });
 
-  test("POST /produtos deve criar produto válido e desfazê-lo após o rollback", async () => {
+  test("POST /produtos deve criar produto válido dentro da transação e desfazê-lo após o rollback", async () => {
     let idCriado;
     const novoProduto = {
       nome: "Teclado Mecânico RGB",
@@ -139,8 +146,8 @@ describe("Testes de integração com rollback transacional real (Produto)", () =
       quantidade: 10,
     };
 
-    await executarComRollback(async (tx) => {
-      const response = await request(app).post("/produtos").send(novoProduto);
+    await executarComRollback(async (tx, http) => {
+      const response = await http.post("/produtos").send(novoProduto);
 
       expect(response.statusCode).toBe(201);
       expect(response.body.nome).toBe(novoProduto.nome);
@@ -149,7 +156,7 @@ describe("Testes de integração com rollback transacional real (Produto)", () =
 
       idCriado = response.body.id;
 
-      // Confirmação DENTRO da transação: o produto foi gravado no escopo de tx
+      // Evidência DENTRO da transação: o produto existe no escopo de tx
       const gravadoNaTx = await tx.produto.findUnique({
         where: { id: idCriado },
       });
@@ -157,7 +164,7 @@ describe("Testes de integração com rollback transacional real (Produto)", () =
       expect(gravadoNaTx.nome).toBe(novoProduto.nome);
     });
 
-    // Confirmação FORA da transação: após o rollback, o registro NÃO existe no banco
+    // Evidência FORA da transação: após o rollback, o registro NÃO existe no banco
     const gravadoAposRollback = await prisma.produto.findUnique({
       where: { id: idCriado },
     });
@@ -165,8 +172,8 @@ describe("Testes de integração com rollback transacional real (Produto)", () =
   });
 
   test("POST /produtos deve rejeitar dados inválidos com status 400", async () => {
-    await executarComRollback(async () => {
-      const response = await request(app).post("/produtos").send({
+    await executarComRollback(async (_tx, http) => {
+      const response = await http.post("/produtos").send({
         nome: "",
         descricao: "Produto Sem Nome",
         preco: 100,
@@ -178,61 +185,83 @@ describe("Testes de integração com rollback transacional real (Produto)", () =
     });
   });
 
-  test("PUT /produtos/:id deve atualizar produto na transação e restaurar valores originais no rollback", async () => {
-    const precoOriginal = produtoPreExistente.preco;
-    const nomeOriginal = produtoPreExistente.nome;
+  test("PUT /produtos/:id deve atualizar fixture dentro da transação e revertê-la no rollback", async () => {
+    let idFixture;
+    const precoOriginal = 150.0;
+    const nomeOriginal = "Mouse Gamer Fixture";
 
-    await executarComRollback(async (tx) => {
-      const response = await request(app)
-        .put(`/produtos/${produtoPreExistente.id}`)
+    await executarComRollback(async (tx, http) => {
+      // Fixture criada estritamente dentro da transação
+      const fixture = await tx.produto.create({
+        data: {
+          nome: nomeOriginal,
+          descricao: "Optico USB",
+          preco: precoOriginal,
+          quantidade: 8,
+        },
+      });
+      idFixture = fixture.id;
+
+      const response = await http
+        .put(`/produtos/${idFixture}`)
         .send({
-          nome: "Monitor Atualizado Temporariamente",
-          descricao: produtoPreExistente.descricao,
-          preco: 9999.99,
-          quantidade: produtoPreExistente.quantidade,
+          nome: "Mouse Gamer Alterado",
+          descricao: "Bluetooth",
+          preco: 299.99,
+          quantidade: 12,
         });
 
       expect(response.statusCode).toBe(200);
-      expect(response.body.nome).toBe("Monitor Atualizado Temporariamente");
-      expect(response.body.preco).toBe(9999.99);
+      expect(response.body.nome).toBe("Mouse Gamer Alterado");
+      expect(response.body.preco).toBe(299.99);
 
-      // Confirmação DENTRO da transação: os dados foram alterados no escopo de tx
+      // Evidência DENTRO da transação: os dados foram alterados no escopo de tx
       const naTx = await tx.produto.findUnique({
-        where: { id: produtoPreExistente.id },
+        where: { id: idFixture },
       });
-      expect(naTx.preco).toBe(9999.99);
-      expect(naTx.nome).toBe("Monitor Atualizado Temporariamente");
+      expect(naTx.nome).toBe("Mouse Gamer Alterado");
+      expect(naTx.preco).toBe(299.99);
     });
 
-    // Confirmação FORA da transação: após o rollback, o registro reassume os dados originais
-    const restaurado = await prisma.produto.findUnique({
-      where: { id: produtoPreExistente.id },
+    // Evidência FORA da transação: a fixture inteira foi revertida pelo rollback
+    const aposRollback = await prisma.produto.findUnique({
+      where: { id: idFixture },
     });
-    expect(restaurado.preco).toBe(precoOriginal);
-    expect(restaurado.nome).toBe(nomeOriginal);
+    expect(aposRollback).toBeNull();
   });
 
-  test("DELETE /produtos/:id deve excluir produto na transação e restaurá-lo no rollback", async () => {
-    await executarComRollback(async (tx) => {
-      const response = await request(app).delete(`/produtos/${produtoPreExistente.id}`);
+  test("DELETE /produtos/:id deve excluir fixture dentro da transação e revertê-la no rollback", async () => {
+    let idFixture;
+
+    await executarComRollback(async (tx, http) => {
+      // Fixture criada estritamente dentro da transação
+      const fixture = await tx.produto.create({
+        data: {
+          nome: "Produto Para Excluir",
+          descricao: "Temporario na tx",
+          preco: 80.0,
+          quantidade: 2,
+        },
+      });
+      idFixture = fixture.id;
+
+      const response = await http.delete(`/produtos/${idFixture}`);
 
       expect(response.statusCode).toBe(200);
       expect(response.body.mensagem).toBe("Produto deletado com sucesso");
 
-      // Confirmação DENTRO da transação: produto não existe no escopo de tx
+      // Evidência DENTRO da transação: fixture não existe mais no escopo de tx
       const naTx = await tx.produto.findUnique({
-        where: { id: produtoPreExistente.id },
+        where: { id: idFixture },
       });
       expect(naTx).toBeNull();
     });
 
-    // Confirmação FORA da transação: após o rollback, o produto excluído voltou a existir intacto
-    const restaurado = await prisma.produto.findUnique({
-      where: { id: produtoPreExistente.id },
+    // Evidência FORA da transação: a criação e exclusão da fixture foram revertidas
+    const aposRollback = await prisma.produto.findUnique({
+      where: { id: idFixture },
     });
-    expect(restaurado).not.toBeNull();
-    expect(restaurado.id).toBe(produtoPreExistente.id);
-    expect(restaurado.nome).toBe(produtoPreExistente.nome);
+    expect(aposRollback).toBeNull();
   });
 
   test("Garante que o rollback é executado mesmo se o teste falhar", async () => {
@@ -240,8 +269,8 @@ describe("Testes de integração com rollback transacional real (Produto)", () =
 
     let erroCapturado = null;
     try {
-      await executarComRollback(async () => {
-        await request(app).post("/produtos").send({
+      await executarComRollback(async (_tx, http) => {
+        await http.post("/produtos").send({
           nome: "Produto Não Persistido",
           descricao: "Falha intencional",
           preco: 50.0,
@@ -255,10 +284,9 @@ describe("Testes de integração com rollback transacional real (Produto)", () =
       erroCapturado = err;
     }
 
-    // Comprova que a asserção falhou e foi capturada, mas a tabela foi 100% preservada
+    // Comprova que a asserção falhou e foi capturada, mas a tabela permaneceu 100% intacta
     expect(erroCapturado).not.toBeNull();
     const depois = await prisma.produto.findMany({ orderBy: { id: "asc" } });
     expect(depois).toEqual(antes);
   });
 });
-
