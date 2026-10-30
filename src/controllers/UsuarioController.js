@@ -1,12 +1,18 @@
-const prisma = require("../config/prisma");
+const defaultPrisma = require("../config/prisma");
 const validarUsuario = require("../utils/validarUsuario");
+
+// Permite obter o cliente Prisma da requisição (injetado via middleware/app) ou o padrão
+function getPrisma(req) {
+  return req?.prisma || req?.app?.get("prisma") || defaultPrisma;
+}
 
 function idValido(id) {
   return Number.isInteger(id) && id > 0;
 }
 
-exports.listarTodos = async (_req, res) => {
+exports.listarTodos = async (req, res) => {
   try {
+    const prisma = getPrisma(req);
     const usuarios = await prisma.usuario.findMany({ orderBy: { id: "asc" } });
     return res.status(200).json(usuarios);
   } catch (error) {
@@ -17,6 +23,7 @@ exports.listarTodos = async (_req, res) => {
 
 exports.buscarPorId = async (req, res) => {
   try {
+    const prisma = getPrisma(req);
     const id = Number(req.params.id);
     if (!idValido(id)) return res.status(400).json({ error: "ID inválido" });
     const usuario = await prisma.usuario.findUnique({ where: { id } });
@@ -31,6 +38,7 @@ exports.buscarPorId = async (req, res) => {
 
 exports.criar = async (req, res) => {
   try {
+    const prisma = getPrisma(req);
     const { nome, telefone, email, senha } = req.body;
     const erro = validarUsuario(nome, telefone, email, senha);
     if (erro) return res.status(400).json({ error: erro });
@@ -51,6 +59,7 @@ exports.criar = async (req, res) => {
 
 exports.atualizar = async (req, res) => {
   try {
+    const prisma = getPrisma(req);
     const id = Number(req.params.id);
     if (!idValido(id)) return res.status(400).json({ error: "ID inválido" });
     const usuarioExistente = await prisma.usuario.findUnique({ where: { id } });
@@ -77,6 +86,7 @@ exports.atualizar = async (req, res) => {
 
 exports.deletar = async (req, res) => {
   try {
+    const prisma = getPrisma(req);
     const id = Number(req.params.id);
     if (!idValido(id)) return res.status(400).json({ error: "ID inválido" });
     const usuarioExistente = await prisma.usuario.findUnique({ where: { id } });

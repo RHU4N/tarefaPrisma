@@ -1,11 +1,20 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const prisma = require("./config/prisma");
 const produtoRoutes = require("./routers/ProdutosRoutes.js");
 const usuarioRoutes = require("./routers/UsuarioRoutes.js");
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Injeção de dependência do Prisma: permite que testes compartilhem cliente transacional
+app.set("prisma", prisma);
+app.use((req, res, next) => {
+  req.prisma = app.get("prisma") || prisma;
+  next();
+});
+
 app.get("/", (req, res) => {
   res.send("API de produtos funcionando");
 });

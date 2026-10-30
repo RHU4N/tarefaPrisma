@@ -1,9 +1,15 @@
-const prisma = require("../config/prisma");
+const defaultPrisma = require("../config/prisma");
 const validarProduto = require("../utils/validarProduto");
+
+// Permite obter o cliente Prisma da requisição (injetado via middleware/app) ou o padrão
+function getPrisma(req) {
+  return req?.prisma || req?.app?.get("prisma") || defaultPrisma;
+}
 
 // LISTAR TODOS
 exports.listar = async (req, res) => {
   try {
+    const prisma = getPrisma(req);
     const produtos = await prisma.produto.findMany({
       orderBy: { id: "asc" },
     });
@@ -17,6 +23,7 @@ exports.listar = async (req, res) => {
 // BUSCAR POR ID
 exports.buscarPorId = async (req, res) => {
   try {
+    const prisma = getPrisma(req);
     const id = Number(req.params.id);
 
     if (isNaN(id)) {
@@ -40,6 +47,7 @@ exports.buscarPorId = async (req, res) => {
 // CRIAR
 exports.criar = async (req, res) => {
   try {
+    const prisma = getPrisma(req);
     const { nome, descricao, preco, quantidade } = req.body;
 
     const erro = validarProduto(nome, preco, quantidade);
@@ -67,6 +75,7 @@ exports.criar = async (req, res) => {
 // ATUALIZAR
 exports.atualizar = async (req, res) => {
   try {
+    const prisma = getPrisma(req);
     const id = Number(req.params.id);
     const { nome, descricao, preco, quantidade } = req.body;
 
@@ -108,6 +117,7 @@ exports.atualizar = async (req, res) => {
 // DELETAR
 exports.deletar = async (req, res) => {
   try {
+    const prisma = getPrisma(req);
     const id = Number(req.params.id);
 
     if (isNaN(id)) {
